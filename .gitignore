@@ -1,0 +1,13 @@
+# macOS
+.DS_Store
+._*
+
+# editors / IDEs
+.idea/
+.junie/
+.vscode/
+*.swp
+*~
+
+# local agent config
+.claude/settings.local.json

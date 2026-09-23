@@ -1,0 +1,656 @@
+#!/usr/bin/env bash
+# Manage multiple gh PATs under local aliases
+#
+#   gh pat login    register or update a token
+#   gh pat logout   remove a token
+#   gh pat rotate   replace tokens that are close to expiry
+#                   --days N to change the 15-day threshold, --all for every alias
+#   gh pat switch   change the active account
+#   gh pat list     list aliases and verify consistency
+#   gh pat current  print the active alias (for shell prompts)
+set -euo pipefail
+
+readonly PREFIX='go-keyring-base64:'
+readonly HOST='github.com'
+readonly ROTATE_DAYS=15   # default for rotate; override per run with --days N
+
+[[ $(uname) == Darwin ]] || { echo "gh-pat: macOS only" >&2; exit 1; }
+
+# token material never outlives the process, including on early exit
+trap 'unset tok ANS back raw 2>/dev/null || true' EXIT
+
+# ---------------- colors ----------------
+if [[ -t 1 && -z ${NO_COLOR-} ]]; then
+  C_Q=$'\033[1;32m'; C_B=$'\033[1m'; C_A=$'\033[36m'
+  C_D=$'\033[2m';    C_E=$'\033[31m'; C_R=$'\033[0m'
+  C_W=$'\033[33m'
+else
+  C_Q='' C_B='' C_A='' C_D='' C_E='' C_R='' C_W=''
+fi
+
+tip() { printf '%s%s%s\n' "$C_D" "$1" "$C_R"; }
+ok()  { printf '%s✓%s %s\n' "$C_Q" "$C_R" "$1"; }
+err() { printf '%s✗%s %s\n' "$C_E" "$C_R" "$1" >&2; }
+# Distinct from err: the operation still goes ahead, so ✗ would misread as a failure.
+warn() { printf '%s⚠%s %s\n' "$C_W" "$C_R" "$1" >&2; }
+
+ask()        { printf '%s?%s %s%s%s ' "$C_Q" "$C_R" "$C_B" "$1" "$C_R"; read -r ANS < /dev/tty; }
+ask_secret() { printf '%s?%s %s%s%s ' "$C_Q" "$C_R" "$C_B" "$1" "$C_R"; read -rs ANS < /dev/tty; echo; }
+
+# ---------------- arrow-key menu ----------------
+# bash 3.2 does not accept fractional read -t values
+if (( ${BASH_VERSINFO[0]} >= 4 )); then readonly ESC_T=0.05; else readonly ESC_T=1; fi
+
+# menu_select <prompt> <label>...   → SEL_IDX (-1 when cancelled)
+# set MENU_NOTE beforehand to show a non-selectable context line under the prompt
+menu_select() {
+  local prompt=$1; shift
+  local n=$# i key rest sel=0 stty_saved
+  local labels=("$@")
+  local note=${MENU_NOTE-} note_lines=0
+  [[ -n $note ]] && note_lines=1
+
+  if [[ ! -t 0 || ! -t 1 || $n -eq 0 ]]; then SEL_IDX=-1; MENU_NOTE=''; return 1; fi
+
+  printf '%s?%s %s%s%s %s(use ↑/↓ to navigate, Enter to select, q to cancel)%s\n' \
+    "$C_Q" "$C_R" "$C_B" "$prompt" "$C_R" "$C_D" "$C_R"
+  [[ -n $note ]] && printf '%s\n' "$note"
+
+  stty_saved=$(stty -g)
+  printf '\033[?25l'
+  trap 'stty "$stty_saved" 2>/dev/null; printf "\033[?25h"' INT TERM
+
+  local first=1
+  while true; do
+    if (( first )); then first=0; else printf '\033[%dA' "$n"; fi
+    for (( i=0; i<n; i++ )); do
+      printf '\033[2K'
+      if (( i == sel )); then
+        printf '%s❯ %s%s\n' "$C_A" "${labels[$i]}" "$C_R"
+      else
+        printf '  %s\n' "${labels[$i]}"
+      fi
+    done
+
+    IFS= read -rsn1 key || key=q
+    case $key in
+      $'\033')
+        rest=''
+        IFS= read -rsn2 -t "$ESC_T" rest || rest=''
+        case $rest in
+          '[A'|'OA') sel=$(( (sel - 1 + n) % n )) ;;
+          '[B'|'OB') sel=$(( (sel + 1) % n )) ;;
+          '')        sel=-1; break ;;              # bare ESC = cancel
+        esac
+        ;;
+      k) sel=$(( (sel - 1 + n) % n )) ;;
+      j) sel=$(( (sel + 1) % n )) ;;
+      q) sel=-1; break ;;
+      '') break ;;                                 # Enter
+    esac
+  done
+
+  # collapse prompt + note + menu into a single answered line
+  local total=$(( n + note_lines + 1 ))
+  printf '\033[%dA' "$total"
+  for (( i=0; i<total; i++ )); do printf '\033[2K\n'; done
+  printf '\033[%dA' "$total"
+  if (( sel < 0 )); then
+    printf '%s?%s %s%s%s %s(cancelled)%s\n' "$C_Q" "$C_R" "$C_B" "$prompt" "$C_R" "$C_D" "$C_R"
+  else
+    printf '%s?%s %s%s%s %s%s%s\n' "$C_Q" "$C_R" "$C_B" "$prompt" "$C_R" "$C_A" "${labels[$sel]}" "$C_R"
+  fi
+
+  stty "$stty_saved" 2>/dev/null || true
+  printf '\033[?25h'
+  trap - INT TERM
+  MENU_NOTE=''
+  SEL_IDX=$sel
+  (( sel >= 0 ))
+}
+
+# The trailing blank line is printed here rather than carried as a `#` line in the
+# header, which would leave a stray comment sitting against `set -euo pipefail`.
+usage() { sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'; echo; exit "${1:-0}"; }
+
+hosts="${GH_CONFIG_DIR:-$HOME/.config/gh}/hosts.yml"
+
+aliases() { grep -oE '^        [^ ]+:$' "$hosts" 2>/dev/null | tr -d ' :' || true; }
+active()  { awk '/^    user: /{print $2}' "$hosts" 2>/dev/null || true; }
+has()     { grep -q "^        ${1}:[[:space:]]*\$" "$hosts" 2>/dev/null; }
+in_keychain() { security find-generic-password -s "gh:${HOST}" -a "$1" >/dev/null 2>&1; }
+
+# Keychain entries with no matching name in hosts.yml — shown to the user as "keychain
+# only". `gh auth logout` produces one every time: it drops the name and switches away but
+# leaves the secret intact, so such a PAT is a working credential with nothing using it.
+#
+# dump-keychain takes no service argument, so this reads every entry on the machine and
+# keeps them apart itself. Each record repeats keychain:/class:/attributes: before its
+# fields, and attributes are printed alphabetically, so acct arrives before svce — clear
+# acct at the record boundary, collect it, decide at svce. The reset is what keeps gh's
+# unnamed entry (it stores a copy of the active token under `"acct"<blob>=<NULL>`, which
+# the pattern below does not match) from being credited with the name above it.
+orphans() {
+  security dump-keychain 2>/dev/null | awk -v s="gh:${HOST}" '
+    /^keychain: / { acct="" }
+    /^[[:space:]]*"acct"<blob>="/ {
+      a=$0; sub(/^[^=]*="/,"",a); sub(/"$/,"",a); acct=a; next
+    }
+    /^[[:space:]]*"svce"<blob>="/ {
+      v=$0; sub(/^[^=]*="/,"",v); sub(/"$/,"",v)
+      if (v==s && acct!="") print acct
+    }
+  ' | sort -u | while read -r a; do
+      has "$a" || printf '%s\n' "$a"
+    done
+}
+
+token_kind() {
+  local raw tok
+  raw=$(security find-generic-password -s "gh:${HOST}" -a "$1" -w 2>/dev/null) \
+    || { echo 'MISSING keychain'; return; }
+  if [[ $raw == ${PREFIX}* ]]; then
+    tok=$(printf '%s' "${raw#$PREFIX}" | base64 -d 2>/dev/null || echo '')
+  else
+    tok=$raw
+  fi
+  case $tok in
+    ghp_*)        echo classic ;;
+    gho_*)        echo oauth ;;
+    ghu_*|ghs_*)  echo app ;;
+    github_pat_*) echo fine-grained ;;
+    '')           echo 'DECODE FAILED' ;;
+    *)            echo unknown ;;
+  esac
+}
+
+# True when the stored value carries the `go-keyring-base64:` prefix, which is what both
+# this tool and gh write. A bare value still works through a fallback in go-keyring, but
+# nothing here produces one — it means something else wrote to the entry directly.
+standard_format() {
+  local raw
+  raw=$(security find-generic-password -s "gh:${HOST}" -a "$1" -w 2>/dev/null) || return 0
+  [[ $raw == ${PREFIX}* ]]
+}
+
+# A pasted token is invisible — ask_secret reads with read -rs, deliberately — so a
+# mistyped or truncated paste is only caught by checking it before it is stored.
+# Same prefixes token_kind reports, but against a value not yet in the keychain.
+looks_like_token() {
+  case $1 in
+    ghp_*|gho_*|ghu_*|ghs_*|github_pat_*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Resolves the account a token belongs to, or fails. Deliberately not `gh auth login
+# --with-token`: that keys the entry by the login name it reads back, overwriting any
+# other alias for the same account — the exact thing this tool exists to avoid.
+# Sets TOKEN_LOGIN on success; leaves gh's own state untouched either way.
+token_login() {
+  local body code
+  body=$(curl -s -w '\n%{http_code}' -H "Authorization: Bearer $1" \
+         https://api.github.com/user 2>/dev/null) || return 1
+  code=$(printf '%s' "$body" | tail -1)
+  [[ $code == 200 ]] || return 1
+  TOKEN_LOGIN=$(printf '%s' "$body" | sed -n 's/.*"login"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
+  [[ -n $TOKEN_LOGIN ]]
+}
+
+ask_alias() {
+  ask "$1"
+  alias_=$ANS
+  [[ -n $alias_ ]] || { err "Alias is required."; exit 1; }
+  [[ $alias_ =~ ^[A-Za-z0-9][A-Za-z0-9_-]*$ ]] \
+    || { err "Invalid alias '${alias_}': must start with alphanumeric, [A-Za-z0-9_-] only."; exit 1; }
+}
+
+case ${1-} in
+  login|logout|rotate|switch|list|current) mode=$1 ;;
+  -h|--help|'') usage ;;
+  # blank line on stderr, next to the error it separates — not on usage's stdout
+  *) err "unknown command: $1"; echo >&2; usage 1 ;;
+esac
+
+# Only rotate takes options; the rest answer -h/--help here because `gh pat <cmd> --help`
+# arrives as a plain argument. Without it, list and current would ignore the flag and run
+# anyway, and switch, logout and login would drop into a prompt — the worst possible
+# answer to a request for help.
+case ${2-} in
+  -h|--help) [[ $mode == rotate ]] || usage ;;
+esac
+
+# ---------------- current ----------------
+if [[ $mode == current ]]; then
+  active
+  exit 0
+fi
+
+# ---------------- list ----------------
+if [[ $mode == list ]]; then
+  [[ -f $hosts ]] || { err "no hosts.yml: ${hosts}"; exit 1; }
+  cur=$(active)
+  found=0
+  while read -r a; do
+    [[ -n $a ]] || continue
+    found=1
+    if [[ $a == "$cur" ]]; then mark="${C_Q}*${C_R}"; else mark=' '; fi
+    if in_keychain "$a"; then
+      # The storage format is only worth a column when it is wrong: everything this tool
+      # and gh write carries the prefix, so saying so on every row is noise. The padding
+      # and separator go with the note, so an ordinary row ends after the token kind.
+      if standard_format "$a"; then
+        printf '%s %-26s %s%s%s\n' "$mark" "$a" "$C_A" "$(token_kind "$a")" "$C_R"
+      else
+        printf '%s %-26s %s%-14s%s %snonstandard format%s\n' "$mark" "$a" \
+          "$C_A" "$(token_kind "$a")" "$C_R" "$C_W" "$C_R"
+      fi
+    else
+      # No entry to read, so the kind is unknown rather than absent — a dash holds the
+      # column so the note below lines up with every other note.
+      printf '%s %-26s %s%-14s%s %sMISSING keychain%s\n' "$mark" "$a" \
+        "$C_A" '-' "$C_R" "$C_E" "$C_R"
+    fi
+  done < <(aliases)
+  (( found )) || tip "(no aliases)"
+
+  # Anything reaching here still holds a value, so the kind is worth showing — it says
+  # what kind of credential is sitting in the keychain with nothing referencing it.
+  while read -r a; do
+    [[ -n $a ]] || continue
+    printf '  %-26s %s%-14s%s %s%s%s\n' "$a" \
+      "$C_A" "$(token_kind "$a")" "$C_R" "$C_D" 'keychain only' "$C_R"
+  done < <(orphans)
+  exit 0
+fi
+
+# ---------------- switch ----------------
+if [[ $mode == switch ]]; then
+  [[ -f $hosts ]] || { err "no hosts.yml: ${hosts}"; exit 1; }
+  cur=$(active)
+
+  names=(); labels=()
+  while read -r a; do
+    [[ -n $a ]] || continue
+    [[ $a == "$cur" ]] && continue
+    names[${#names[@]}]=$a
+    labels[${#labels[@]}]="$(printf '%-26s [%s]' "$a" "$(token_kind "$a")")"
+  done < <(aliases)
+
+  cur_line=''
+  if [[ -n $cur ]]; then
+    cur_line="$(printf '%s*%s %s%-26s%s %s[%s]%s' \
+      "$C_Q" "$C_R" "$C_A" "$cur" "$C_R" "$C_D" "$(token_kind "$cur")" "$C_R")"
+  fi
+
+  if ! (( ${#names[@]} )); then
+    [[ -n $cur_line ]] && printf '%s\n' "$cur_line"
+    tip "No other alias to switch to."
+    exit 0
+  fi
+
+  # A menu of one is a confirmation, not a choice, and switching costs nothing to undo —
+  # the success line below says which alias was picked. MENU_NOTE is set inside the menu
+  # branch so it is never left assigned for a call that does not happen.
+  if (( ${#names[@]} == 1 )); then
+    alias_=${names[0]}
+  else
+    MENU_NOTE=$cur_line
+    if menu_select "Which alias do you want to activate?" "${labels[@]}"; then
+      alias_=${names[$SEL_IDX]}
+    else
+      tip "Cancelled."; exit 0
+    fi
+  fi
+
+  in_keychain "$alias_" || { err "No keychain entry for '${alias_}'. Run: gh pat login"; exit 1; }
+
+  # gh reports the switch on stderr, which would duplicate the line printed below
+  gh auth switch -u "$alias_" >/dev/null 2>&1
+  ok "Active account is now ${C_A}${alias_}${C_R} ${C_D}[$(token_kind "$alias_")] account=$(gh api user --jq .login 2>/dev/null)${C_R}"
+  exit 0
+fi
+
+# ---------------- logout ----------------
+if [[ $mode == logout ]]; then
+  [[ -f $hosts ]] || { err "no hosts.yml: ${hosts}"; exit 1; }
+  cur=$(active)
+
+  names=(); labels=()
+  while read -r a; do
+    [[ -n $a ]] || continue
+    names[${#names[@]}]=$a
+    if [[ $a == "$cur" ]]; then
+      labels[${#labels[@]}]="$(printf '%-26s [%s] (active)' "$a" "$(token_kind "$a")")"
+    else
+      labels[${#labels[@]}]="$(printf '%-26s [%s]' "$a" "$(token_kind "$a")")"
+    fi
+  done < <(aliases)
+  registered=${#names[@]}
+
+  # Orphans are listed here or nowhere. gh has dropped the name, so `gh auth logout` can
+  # no longer reach the entry, and the secret it left behind still works.
+  while read -r a; do
+    [[ -n $a ]] || continue
+    names[${#names[@]}]=$a
+    labels[${#labels[@]}]="$(printf '%-26s [%s] keychain only' "$a" "$(token_kind "$a")")"
+  done < <(orphans)
+
+  (( ${#names[@]} )) || { err "No aliases registered."; exit 1; }
+
+  # The row has no space to explain itself, and "keychain only" is a state worth spelling
+  # out before someone deletes one. Said as a consequence rather than as internal state:
+  # what matters is that the token cannot be used, not that hosts.yml lacks a line.
+  # MENU_NOTE takes exactly one line.
+  if (( ${#names[@]} > registered )); then
+    MENU_NOTE="$(printf '  %skeychain only — the token is still stored but cannot be used to log in%s' \
+      "$C_D" "$C_R")"
+  fi
+
+  if menu_select "Which alias do you want to remove?" "${labels[@]}"; then
+    alias_=${names[$SEL_IDX]}
+    # Anything past the registered block came from orphans(), so hosts.yml has no line
+    # for it and the active-account handling below does not apply.
+    (( SEL_IDX >= registered )) && is_orphan=true || is_orphan=false
+  else
+    tip "Cancelled."; exit 0
+  fi
+
+  # An oauth or app token got there through gh, not through this tool: removing it ends
+  # a browser session gh-pat never opened. Worth saying before the y/N, not after.
+  # Orphans are exempt — gh already logged that session out, which is how they got here.
+  if ! $is_orphan; then
+    case $(token_kind "$alias_") in
+      oauth|app)
+        echo
+        warn "'${alias_}' holds a token gh-pat did not store."
+        tip "It came from gh auth login, and removing it ends that session."
+        tip "gh auth logout -h ${HOST} -u ${alias_} is the matching command."
+        echo
+        ;;
+    esac
+  fi
+
+  ask "Remove ${C_A}${alias_}${C_R}${C_B}?${C_R} ${C_D}[y/N]${C_R}"
+  [[ $ANS == [yY] ]] || { tip "Cancelled."; exit 0; }
+
+  # An orphan has no hosts.yml line and cannot be the active account, so only the
+  # keychain entry needs removing.
+  if $is_orphan; then
+    security delete-generic-password -s "gh:${HOST}" -a "$alias_" >/dev/null 2>&1 || true
+    ok "Removed ${C_A}${alias_}${C_R} ${C_D}(keychain entry)${C_R}"
+    exit 0
+  fi
+
+  if [[ $cur == "$alias_" ]]; then
+    next=$(aliases | grep -vx "$alias_" | head -1 || true)
+    if [[ -n $next ]]; then
+      gh auth switch -u "$next" >/dev/null 2>&1 && ok "Active account is now ${C_A}${next}${C_R}"
+    else
+      sed -i '' "/^    user: ${alias_}\$/d" "$hosts"
+    fi
+  fi
+
+  security delete-generic-password -s "gh:${HOST}" -a "$alias_" >/dev/null 2>&1 || true
+  sed -i '' "/^        ${alias_}:[[:space:]]*\$/d" "$hosts"
+  ok "Removed ${C_A}${alias_}${C_R}"
+  exit 0
+fi
+
+# ---------------- rotate ----------------
+# Replaces the keychain value for existing aliases. hosts.yml is untouched: rotation
+# changes the secret, not the alias. GitHub has no API for creating PATs, so the token
+# itself still has to be generated in the browser and pasted here.
+if [[ $mode == rotate ]]; then
+  [[ -f $hosts ]] || { err "no hosts.yml: ${hosts}"; exit 1; }
+
+  # Options are validated before the terminal check, so a typo is reported as a typo
+  # even when there is no tty to report it to.
+  all=false; days_max=$ROTATE_DAYS
+  shift                                   # drop the subcommand itself
+  while (( $# )); do
+    case $1 in
+      --all)     all=true ;;
+      --days)    shift
+                 [[ ${1-} =~ ^[0-9]+$ ]] || { err "--days needs a whole number of days."; exit 1; }
+                 days_max=$1 ;;
+      -h|--help) usage ;;
+      *)         err "unknown option: $1"; usage 1 ;;
+    esac
+    shift
+  done
+
+  # ask_secret reads from /dev/tty, so without one the loop would die mid-alias with a
+  # raw device error, after the expiry lookups have already hit the API.
+  [[ -t 0 ]] || { err "rotate needs a terminal to paste tokens into."; exit 1; }
+
+  # State the criterion before listing what it filtered out — otherwise the skip lines
+  # below are verdicts with no stated rule, and the default threshold is invisible.
+  # --all skips the comparison entirely, so --days next to it does nothing; say so here.
+  if $all; then
+    if (( days_max != ROTATE_DAYS )); then
+      tip "Every alias — --all ignores --days ${days_max}."
+    else
+      tip "Every alias, whatever its expiry."
+    fi
+  else
+    tip "Tokens expiring within ${days_max} days."
+  fi
+  # No blank line here: skip lines follow the criterion directly as its result list,
+  # and each rotate candidate already opens with its own leading newline.
+
+  cur=$(active)
+  now=$(date +%s)
+  done_n=0
+  unknown_n=0
+
+  while read -r a; do
+    [[ -n $a ]] || continue
+    in_keychain "$a" || { printf '  %-26s %s%s%s\n' "$a" "$C_E" 'MISSING keychain' "$C_R"; continue; }
+
+    raw=$(security find-generic-password -s "gh:${HOST}" -a "$a" -w)
+    if [[ $raw == ${PREFIX}* ]]; then
+      tok=$(printf '%s' "${raw#$PREFIX}" | base64 -d 2>/dev/null || echo '')
+    else
+      tok=$raw
+    fi
+
+    # The expiry header is the only reliable source — gh auth status does not report it,
+    # and a token with no expiry omits the header entirely rather than sending a null.
+    # The status code comes back too: without it an unreachable network and a 401 both
+    # produce an empty header, which is indistinguishable from a non-expiring token.
+    resp=$(curl -s -o /dev/null -D - -w '%{http_code}' \
+            -H "Authorization: Bearer ${tok}" https://api.github.com/user 2>/dev/null) || resp=''
+    unset tok
+
+    code=$(printf '%s' "$resp" | tail -1)
+    exp=$(printf '%s' "$resp" \
+          | awk 'tolower($1)=="github-authentication-token-expiration:"{$1="";sub(/^ /,"");print;exit}' \
+          | tr -d '\r')
+
+    # 401 is an answer, not a failure to get one: the token is dead, which makes it the
+    # most urgent thing to replace. 403 only counts when it is not rate limiting — that
+    # exhausts the quota rather than the token, and the secret is still fine. Anything
+    # else non-200 means the question went unanswered, and a token that could not be
+    # checked must not be assumed bad.
+    days=''; unknown=false; invalid=false
+    remaining=$(printf '%s' "$resp" \
+                | awk 'tolower($1)=="x-ratelimit-remaining:"{print $2;exit}' | tr -d '\r')
+    if [[ $code == 401 ]] || [[ $code == 403 && $remaining != 0 ]]; then
+      invalid=true
+    elif [[ $code != 200 ]]; then
+      unknown=true
+    elif [[ -n $exp ]]; then
+      # BSD date cannot parse %Z at all, so strip the trailing zone and force TZ=UTC.
+      # Header format: "YYYY-MM-DD HH:MM:SS UTC"
+      ts=$(TZ=UTC date -j -f '%Y-%m-%d %H:%M:%S' "${exp% *}" +%s 2>/dev/null || echo '')
+      if [[ -n $ts ]]; then days=$(( (ts - now) / 86400 )); else unknown=true; fi
+    fi
+
+    # Without --all, only tokens expiring within the threshold are offered.
+    # A missing expiry means a non-expiring classic PAT, which is skipped by default.
+    # An unknown expiry is skipped too, but in red — it is a failure, not a property.
+    # A rejected token is never skipped: it is already useless, threshold or not.
+    if ! $all && ! $invalid; then
+      if $unknown; then
+        printf '  %-26s %s%s%s\n' "$a" "$C_E" 'expiry unknown — skipped' "$C_R"
+        unknown_n=$(( unknown_n + 1 )); continue
+      fi
+      [[ -n $days ]] || { printf '  %-26s %s%s%s\n' "$a" "$C_D" 'no expiry — skipped' "$C_R"; continue; }
+      (( days > days_max )) && { printf '  %-26s %s%s%s\n' "$a" "$C_D" "expires in ${days}d — skipped" "$C_R"; continue; }
+    fi
+
+    if $invalid; then
+      note="${C_E}REJECTED — the API does not accept this token${C_R}"
+    elif $unknown; then
+      note="${C_E}expiry unknown${C_R}"
+    elif [[ -n $days ]]; then
+      if (( days < 0 )); then note="${C_E}EXPIRED${C_R}"; else note="${C_E}expires in ${days}d${C_R}"; fi
+    else
+      note="${C_D}no expiry${C_R}"
+    fi
+    printf '\n  %s%s%s  %s[%s]%s  %s\n' "$C_A" "$a" "$C_R" "$C_D" "$(token_kind "$a")" "$C_R" "$note"
+
+    # Checked before it is stored, because the paste itself is invisible. A failed check
+    # asks again rather than moving on: leaving the old value in place is right, but so
+    # is letting a mistyped paste be retyped. Enter skips to the next alias.
+    skip=false
+    while true; do
+      ask_secret "New token (Enter to skip):"
+      [[ -n $ANS ]] || { tip "  skipped"; unset ANS; skip=true; break; }
+
+      if ! looks_like_token "$ANS"; then
+        unset ANS
+        err "  not a GitHub token — expected ghp_, gho_, ghu_, ghs_, or github_pat_"
+        continue
+      fi
+      if ! token_login "$ANS"; then
+        unset ANS
+        err "  the API does not accept that token — ${a} left unchanged"
+        continue
+      fi
+      break
+    done
+    $skip && continue
+
+    # -U keeps the entry in place; -T is omitted because on an existing item it counts
+    # as an ACL change, which makes macOS prompt for the keychain password.
+    security add-generic-password -s "gh:${HOST}" -a "$a" \
+      -w "${PREFIX}$(printf '%s' "$ANS" | base64)" -U
+    unset ANS
+
+    back=$(security find-generic-password -s "gh:${HOST}" -a "$a" -w)
+    printf '%s' "${back#$PREFIX}" | base64 -d >/dev/null 2>&1 \
+      || { err "keychain roundtrip failed for ${a}"; exit 1; }
+
+    ok "  updated ${C_A}${a}${C_R} ${C_D}[$(token_kind "$a")] account=${TOKEN_LOGIN}${C_R}"
+    done_n=$(( done_n + 1 ))
+  done < <(aliases)
+
+  echo
+  if (( done_n )); then
+    ok "Rotated ${done_n} token(s)."
+    # Re-activate so the credential helper picks up the new secret for the active alias.
+    [[ -n $cur ]] && gh auth switch -u "$cur" >/dev/null 2>&1
+  else
+    tip "Nothing rotated."
+  fi
+  # Reported separately: an unchecked alias may well be the one that needed rotating.
+  (( unknown_n )) && err "${unknown_n} alias(es) could not be checked — network or token error."
+  exit 0
+fi
+
+# ---------------- login ----------------
+tip "Alias is a local label for this token — it is only used as the keychain lookup key."
+tip "It does not have to match your GitHub username, so you can register several tokens"
+tip "for the same account (e.g. one classic, one fine-grained)."
+tip "Examples: work, personal, classic, ci, readonly"
+echo
+ask_alias "What alias would you like to use for this token?"
+
+existing=false
+if in_keychain "$alias_"; then
+  # The item exists, so -T still has to be left off below — that part is about the ACL,
+  # not about registration. The confirmation is a different question: a "keychain only"
+  # entry is one gh cannot log in with, so reusing the name replaces nothing in use.
+  existing=true
+  if has "$alias_"; then
+    ask "'${alias_}' already exists. Overwrite? ${C_D}[y/N]${C_R}"
+    [[ $ANS == [yY] ]] || { tip "Cancelled."; exit 0; }
+  else
+    tip "Reusing '${alias_}' — it holds a keychain-only token that gh cannot log in with."
+  fi
+fi
+
+echo
+tip "Generate a token at https://github.com/settings/tokens"
+tip "Scope it to whatever you intend to do with it — gh-pat only stores what you paste."
+# Verified before anything is written, because the paste is invisible and a bad value
+# would only surface later as an alias that exists but cannot authenticate. Asking again
+# rather than exiting: the alias is already chosen, and a bad paste is worth one retry,
+# not a restart. Enter on an empty prompt is the way out.
+while true; do
+  ask_secret "Paste your authentication token:"
+  tok=$ANS
+  [[ -n $tok ]] || { unset tok ANS; tip "Cancelled."; exit 0; }
+
+  if ! looks_like_token "$tok"; then
+    unset tok ANS
+    err "Not a GitHub token — expected ghp_, gho_, ghu_, ghs_, or github_pat_"
+    tip "Try again, or press Enter to cancel."
+    continue
+  fi
+  if ! token_login "$tok"; then
+    unset tok ANS
+    err "The API does not accept that token. Nothing was stored."
+    tip "Try again, or press Enter to cancel."
+    continue
+  fi
+  break
+done
+
+# gh stores browser logins under the account name it reads back from the API, in this
+# same keychain entry. An alias equal to that name is therefore shared with gh: a later
+# `gh auth login` overwrites this token, and nothing warns about it at the time.
+# Asked before the write, since after it there is nothing left to decide.
+if [[ $alias_ == "$TOKEN_LOGIN" ]]; then
+  echo
+  warn "'${alias_}' is this token's own account name."
+  tip "gh auth login writes to that same keychain entry, so a browser login would"
+  tip "replace this token silently. A different alias keeps the two apart."
+  echo
+  ask "Use '${alias_}' anyway? ${C_D}[y/N]${C_R}"
+  [[ $ANS == [yY] ]] || { unset tok ANS; tip "Cancelled."; exit 0; }
+  echo
+fi
+
+if $existing; then
+  security add-generic-password -s "gh:${HOST}" -a "$alias_" \
+    -w "${PREFIX}$(printf '%s' "$tok" | base64)" -U
+else
+  security add-generic-password -s "gh:${HOST}" -a "$alias_" \
+    -w "${PREFIX}$(printf '%s' "$tok" | base64)" \
+    -T /usr/bin/security
+fi
+unset tok ANS
+
+# roundtrip check
+back=$(security find-generic-password -s "gh:${HOST}" -a "$alias_" -w)
+printf '%s' "${back#$PREFIX}" | base64 -d >/dev/null 2>&1 \
+  || { err "keychain roundtrip failed"; exit 1; }
+
+# register in hosts.yml — gh config set -h writes into the active user entry, so it is not used
+if [[ ! -f $hosts ]]; then
+  mkdir -p "$(dirname "$hosts")"
+  printf '%s:\n    git_protocol: https\n    users:\n        %s:\n' "$HOST" "$alias_" > "$hosts"
+elif ! grep -q "^${HOST}:" "$hosts"; then
+  printf '%s:\n    git_protocol: https\n    users:\n        %s:\n' "$HOST" "$alias_" >> "$hosts"
+elif ! has "$alias_"; then
+  sed -i '' "/^    users:\$/a\\
+        ${alias_}:
+" "$hosts"
+fi
+
+gh auth switch -u "$alias_" >/dev/null 2>&1
+# TOKEN_LOGIN came from the pre-store check, so the account is already known here.
+ok "Logged in as ${C_A}${alias_}${C_R} ${C_D}[$(token_kind "$alias_")] account=${TOKEN_LOGIN}${C_R}"

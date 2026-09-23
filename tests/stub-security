@@ -1,0 +1,104 @@
+#!/usr/bin/env bash
+# Test double for /usr/bin/security, put on PATH by test.sh so the gh-pat subprocess
+# reaches it instead of the real binary. Reads and writes $KEYCHAIN — one
+# `alias<TAB>value` per line — and never touches a real credential.
+#
+# What it imitates is the table under "What `security` is assumed to do" in SPEC.md —
+# exit codes, output, and the dump-keychain record layout. Change one and change the
+# other, or the tests start checking against something the real binary never did.
+#
+# If the real security stops matching this, every test still passes and the tool still
+# breaks. See "Verifying a change" in CLAUDE.md for the checks that exist to catch that.
+set -uo pipefail
+
+cmd=${1-}; shift || true
+
+svc='' acct='' val='' want_value=false update=false
+while (( $# )); do
+  case $1 in
+    -s) svc=${2-}; shift 2 ;;
+    -a) acct=${2-}; shift 2 ;;
+    -w) # -w carries a value for add-, and carries none for find-
+        if [[ $cmd == add-generic-password ]]; then val=${2-}; shift 2
+        else want_value=true; shift; fi ;;
+    -U) update=true; shift ;;
+    -T) shift 2 ;;                                 # ACL entry: accepted, ignored
+    *)  shift ;;
+  esac
+done
+
+# Only gh's own service exists as far as these tests are concerned.
+[[ $svc == gh:github.com || $cmd == dump-keychain ]] || exit 44
+
+# Matching by service alone finds nothing — verified against the real security, which
+# answers 44 even with several items stored under that service.
+[[ -n $acct || $cmd == dump-keychain ]] || {
+  echo "security: SecKeychainSearchCopyNext: The specified item could not be found in the keychain." >&2
+  exit 44
+}
+
+# Prints the stored value for an account, or fails if there is no such line.
+line_for() {
+  awk -F'\t' -v a="$1" '$1==a {print $2; found=1} END {exit !found}' "$KEYCHAIN"
+}
+
+rewrite_without() {  # drop one account from the state file
+  local tmp
+  tmp=$(mktemp "${TMPDIR:-/tmp}/stub-security.XXXXXX") || return 1
+  awk -F'\t' -v a="$1" '$1!=a' "$KEYCHAIN" > "$tmp"
+  mv "$tmp" "$KEYCHAIN"
+}
+
+case $cmd in
+  find-generic-password)
+    stored=$(line_for "$acct") || {
+      echo "security: SecKeychainSearchCopyNext: The specified item could not be found in the keychain." >&2
+      exit 44
+    }
+    # An `if` rather than `$want_value && printf`, which leaves a false exit status when
+    # no value was asked for. The explicit exit at the end covers that too; both are here
+    # because in_keychain reads this status as "does the entry exist", and getting it
+    # wrong makes every alias look missing without failing anything loudly.
+    if $want_value; then printf '%s\n' "$stored"; fi
+    ;;
+
+  add-generic-password)
+    # Without -U an existing item is refused rather than replaced, and the stored value
+    # is left alone. gh-pat relies on this: login passes -T without -U when creating an
+    # entry, so a name already in the keychain would stop it rather than overwrite.
+    if ! $update && line_for "$acct" >/dev/null; then
+      echo "security: SecKeychainItemCreateFromContent (<default>): The specified item already exists in the keychain." >&2
+      exit 45
+    fi
+    rewrite_without "$acct"
+    printf '%s\t%s\n' "$acct" "$val" >> "$KEYCHAIN"
+    ;;
+
+  delete-generic-password)
+    line_for "$acct" >/dev/null || {
+      echo "security: SecKeychainSearchCopyNext: The specified item could not be found in the keychain." >&2
+      exit 44
+    }
+    rewrite_without "$acct"
+    # The real one echoes the record it removed. gh-pat discards this, but a stub that
+    # stays silent would hide a caller that stopped discarding it.
+    printf 'password has been deleted.\n'
+    ;;
+
+  dump-keychain)
+    while IFS=$'\t' read -r a v; do
+      [[ -n $a || -n $v ]] || continue
+      printf 'keychain: "%s"\nversion: 512\nclass: "genp"\nattributes:\n' "$KEYCHAIN"
+      if [[ $a == '<NULL>' ]]; then
+        printf '    "acct"<blob>=<NULL>\n'
+      else
+        printf '    "acct"<blob>="%s"\n' "$a"
+      fi
+      printf '    "svce"<blob>="gh:github.com"\n'
+    done < "$KEYCHAIN"
+    ;;
+
+  *) exit 1 ;;
+esac
+
+exit 0    # the last command in a branch must not decide the exit status
